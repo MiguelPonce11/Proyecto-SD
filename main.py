@@ -59,18 +59,32 @@ def calibrar_desde_foto(ruta):
         COLORES[nombre]["rangos"] = [(lo, hi)]
         print(f"[calibrado] {nombre}: HSV {lo} -> {hi}")
 
-    # Longitud de cada eslabon en lados de post-it
+    # Tamano del marcador en cm, usando la distancia real base -> codo como regla
     info = []
     for _, _, relleno in hallados:
         M = cv2.moments(relleno, True)
         info.append(((M["m10"] / M["m00"], M["m01"] / M["m00"]), math.sqrt(M["m00"])))
-    GEOM["base_codo"] = math.dist(info[0][0], info[1][0]) / info[0][1]
-    GEOM["codo_punta"] = math.dist(info[1][0], info[2][0]) / info[1][1]
-    print(f"[calibrado] eslabones: {GEOM['base_codo']:.2f} y {GEOM['codo_punta']:.2f} lados de post-it")
+    px_por_cm = math.dist(info[0][0], info[1][0]) / LONG_CM["base_codo"]
+    lado_cm = (info[0][1] + info[1][1] + info[2][1]) / 3 / px_por_cm
+    actualizar_geom(lado_cm)
+    print(f"[calibrado] marcador: {lado_cm:.2f} cm; eslabones: {LONG_CM['base_codo']:g} cm "
+          f"({GEOM['base_codo']:.2f} marcadores) y {LONG_CM['codo_punta']:g} cm "
+          f"({GEOM['codo_punta']:.2f} marcadores)")
 
 
-# Longitud esperada de los eslabones en lados de post-it (la foto la sobreescribe).
-GEOM = {"base_codo": 3.0, "codo_punta": 1.7}
+# Distancias reales entre centros de marcadores, medidas con regla (cm).
+LONG_CM = {"base_codo": 15.0, "codo_punta": 10.0}
+LADO_CM = 2.9            # tamano aproximado del marcador (cm); la foto lo recalcula
+
+
+def actualizar_geom(lado_cm):
+    """Pasa las longitudes de cm a 'tamanos de marcador', que no dependen del zoom del video."""
+    for k, cm in LONG_CM.items():
+        GEOM[k] = cm / lado_cm
+
+
+GEOM = {}
+actualizar_geom(LADO_CM)
 TOL_LONG = 0.45          # tolerancia sobre la longitud del eslabon
 SALTO_MAX = 0.25         # salto maximo entre frames (fraccion del ancho)
 PERDIDO_MAX = 15         # frames sin ver el marcador antes de olvidarlo
@@ -169,24 +183,24 @@ def elegir_video():
     """Pregunta en la terminal que video ejecutar."""
     while True:
         try:
-            r = input("Que video quieres ejecutar? (1, 2 o 3): ").strip()
+            r = input("Que video quieres ejecutar? (1 al 7): ").strip()
         except (EOFError, KeyboardInterrupt):
             raise SystemExit("\nCancelado.")
-        if r in ("1", "2", "3"):
-            ruta = AQUI / f"video{r}.mp4"
+        if r in [str(i) for i in range(1, 8)]:
+            ruta = AQUI / f"vid{r}.mp4"
             if ruta.exists():
                 print(f"Ejecutando {ruta.name}...")
                 return ruta
             print(f"No existe {ruta.name}.")
         else:
-            print("Opcion invalida, escribe 1, 2 o 3.")
+            print("Opcion invalida, escribe un numero del 1 al 7.")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default=None,
                     help="ruta de video o indice de camara; si se omite, se pregunta cual video usar")
-    ap.add_argument("--foto", default=str(AQUI / "Foto de colores .jpeg"),
+    ap.add_argument("--foto", default=str(AQUI / "foto_de_colores.jpeg"),
                     help="foto de referencia para calibrar los colores")
     ap.add_argument("--sin-foto", action="store_true", help="no calibrar con la foto")
     ap.add_argument("--calibrar", action="store_true", help="clic para imprimir HSV")
@@ -219,6 +233,7 @@ def main():
     t0 = time.perf_counter()
     seguidor = Seguidor()
     prev = None
+    escalas = deque(maxlen=30)   # ultimas mediciones de px/cm
     pausa = False
     frame_idx = 0
 
@@ -246,13 +261,20 @@ def main():
                 q1, q2 = angulos(pos["base"], pos["codo"], pos["punta"])
             fila["q1_deg"], fila["q2_deg"] = (round(q1, 2), round(q2, 2)) if q1 is not None else (None, None)
 
-            # velocidad de la punta (px/s)
-            vel = None
+            # escala px/cm: el eslabon base -> codo mide LONG_CM["base_codo"]
+            if pos["base"] and pos["codo"]:
+                escalas.append(math.dist(pos["base"], pos["codo"]) / LONG_CM["base_codo"])
+
+            # velocidad de la punta (px/s y cm/s)
+            vel = vel_cm = None
             if prev and pos["punta"] and prev[1]["punta"] and t > prev[0]:
                 dx = pos["punta"][0] - prev[1]["punta"][0]
                 dy = pos["punta"][1] - prev[1]["punta"][1]
                 vel = math.hypot(dx, dy) / (t - prev[0])
+                if escalas:
+                    vel_cm = vel / float(np.median(escalas))
             fila["vel_punta_px_s"] = round(vel, 1) if vel is not None else None
+            fila["vel_punta_cm_s"] = round(vel_cm, 1) if vel_cm is not None else None
             prev = (t, pos)
             filas.append(fila)
             q1s.append(q1)
@@ -269,7 +291,7 @@ def main():
                 p = [tuple(map(int, pos[k])) for k in ("base", "codo", "punta")]
                 cv2.line(frame, p[0], p[1], (255, 255, 255), 2)
                 cv2.line(frame, p[1], p[2], (255, 255, 255), 2)
-            txt = (f"t={t:6.2f}s  q1={q1:7.1f}  q2={q2:7.1f}  v={vel or 0:7.1f}px/s"
+            txt = (f"t={t:6.2f}s  q1={q1:7.1f}  q2={q2:7.1f}  v={vel_cm or 0:6.1f}cm/s"
                    if q1 is not None else f"t={t:6.2f}s  marcador no detectado")
             h = frame.shape[0]
             cv2.putText(frame, txt, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
